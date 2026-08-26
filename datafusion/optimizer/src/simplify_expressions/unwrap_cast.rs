@@ -60,8 +60,8 @@ use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
 use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_supported_type, is_timestamp_precision_narrowing_cast,
-    try_cast_literal_to_type,
+    is_date_narrowing_cast, is_numeric_narrowing_cast, is_supported_type,
+    is_timestamp_precision_narrowing_cast, try_cast_literal_to_type,
 };
 
 pub(super) fn unwrap_cast_in_comparison_for_binary(
@@ -107,6 +107,28 @@ pub(super) fn unwrap_cast_in_comparison_for_binary(
     }
 }
 
+/// Returns true when unwrapping `cast_expr` out of a comparison could change the
+/// comparison's result.
+///
+/// The numeric range check is limited to `TRY_CAST` because it is `TRY_CAST`
+/// that turns an out-of-range value into `NULL`, which then takes part in
+/// three-valued logic. A plain `CAST` raises on overflow rather than producing a
+/// value the comparison can act on.
+fn is_narrowing_cast(
+    cast_expr: &Expr,
+    inner_type: &DataType,
+    cast_type: &DataType,
+) -> bool {
+    if is_timestamp_precision_narrowing_cast(inner_type, cast_type)
+        || is_date_narrowing_cast(inner_type, cast_type)
+    {
+        return true;
+    }
+
+    matches!(cast_expr, Expr::TryCast(_))
+        && is_numeric_narrowing_cast(inner_type, cast_type)
+}
+
 pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
     info: &SimplifyContext,
     expr: &Expr,
@@ -133,9 +155,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
                 return false;
             };
 
-            if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
-                || is_date_narrowing_cast(&expr_type, field.data_type())
-            {
+            if is_narrowing_cast(expr, &expr_type, field.data_type()) {
                 return false;
             }
 
@@ -176,9 +196,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
         return false;
     }
 
-    if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
-        || is_date_narrowing_cast(&expr_type, field.data_type())
-    {
+    if is_narrowing_cast(expr, &expr_type, field.data_type()) {
         return false;
     }
 
@@ -621,6 +639,52 @@ mod tests {
             .eq(lit_timestamp_nano_none(1_000_000));
         let expected = col("ts_millis_none").eq(lit_timestamp_millis_none(1));
 
+        assert_eq!(optimize_test(expr_input, &schema), expected);
+    }
+
+    #[test]
+    fn test_not_unwrap_narrowing_try_cast() {
+        let schema = expr_test_schema();
+
+        // An Int64 value outside the Int32 range becomes NULL under try_cast, so
+        // `c2 > 1` would compare the raw value where the original yields UNKNOWN.
+        let expr_input = try_cast(col("c2"), DataType::Int32).gt(lit(1i32));
+        assert_eq!(optimize_test(expr_input.clone(), &schema), expr_input);
+    }
+
+    #[test]
+    fn test_not_unwrap_narrowing_try_cast_inlist() {
+        let schema = expr_test_schema();
+
+        // NOT IN makes it worse: false instead of NULL flips to true under
+        // negation and admits a row that must be excluded.
+        let expr_input = in_list(
+            try_cast(col("c2"), DataType::Int32),
+            vec![lit(1i32), lit(2i32), lit(3i32), lit(4i32), lit(5i32)],
+            true,
+        );
+        assert_eq!(optimize_test(expr_input.clone(), &schema), expr_input);
+    }
+
+    #[test]
+    fn test_unwrap_widening_try_cast() {
+        let schema = expr_test_schema();
+
+        // Every Int32 value is representable as Int64, so try_cast can never
+        // produce NULL here and the rewrite stays sound.
+        let expr_input = try_cast(col("c1"), DataType::Int64).gt(lit(1i64));
+        assert_eq!(optimize_test(expr_input, &schema), col("c1").gt(lit(1i32)));
+
+        let expr_input = in_list(
+            try_cast(col("c1"), DataType::Int64),
+            vec![lit(1i64), lit(2i64), lit(3i64), lit(4i64), lit(5i64)],
+            false,
+        );
+        let expected = in_list(
+            col("c1"),
+            vec![lit(1i32), lit(2i32), lit(3i32), lit(4i32), lit(5i32)],
+            false,
+        );
         assert_eq!(optimize_test(expr_input, &schema), expected);
     }
 

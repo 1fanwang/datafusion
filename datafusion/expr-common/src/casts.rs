@@ -26,7 +26,7 @@ use std::cmp::Ordering;
 use arrow::datatypes::{
     DataType, MAX_DECIMAL32_FOR_EACH_PRECISION, MAX_DECIMAL64_FOR_EACH_PRECISION,
     MAX_DECIMAL128_FOR_EACH_PRECISION, MIN_DECIMAL32_FOR_EACH_PRECISION,
-    MIN_DECIMAL64_FOR_EACH_PRECISION, MIN_DECIMAL128_FOR_EACH_PRECISION, TimeUnit,
+    MIN_DECIMAL64_FOR_EACH_PRECISION, MIN_DECIMAL128_FOR_EACH_PRECISION, TimeUnit, i256,
 };
 use arrow::temporal_conversions::{
     MICROSECONDS, MILLISECONDS, MILLISECONDS_IN_DAY, NANOSECONDS,
@@ -155,6 +155,104 @@ pub fn is_timestamp_precision_narrowing_cast(
 /// see; the widening direction (`Date32 -> Date64`) is injective and stays allowed.
 pub fn is_date_narrowing_cast(from_type: &DataType, to_type: &DataType) -> bool {
     matches!((from_type, to_type), (DataType::Date64, DataType::Date32))
+}
+
+/// Returns true when some value of `from_type` falls outside the range of
+/// `to_type`.
+///
+/// `TRY_CAST` yields `NULL` for such a value, and `NULL` is `UNKNOWN` under SQL
+/// three-valued logic, so `try_cast(col AS INT) > 1` must not match a row whose
+/// value does not fit in `INT`. Unwrapping that to `col > 1` compares the raw
+/// value instead and matches the row, so the rewrite has to be declined for a
+/// narrowing cast. Widening stays eligible, which is the case the rule mainly
+/// exists to serve.
+///
+/// Only the range is compared. A cast that stays in range but loses fractional
+/// digits, such as `Decimal128(18, 2)` to `Int64`, is many-to-one rather than
+/// `NULL`-producing and is out of scope here.
+///
+/// Temporal types are handled by [`is_timestamp_precision_narrowing_cast`] and
+/// [`is_date_narrowing_cast`] instead, and are not considered here.
+pub fn is_numeric_narrowing_cast(from_type: &DataType, to_type: &DataType) -> bool {
+    let from_type = dictionary_value_type(from_type);
+    let to_type = dictionary_value_type(to_type);
+    if from_type == to_type {
+        return false;
+    }
+    let (Some(from), Some(to)) = (
+        integer_or_decimal_range(from_type),
+        integer_or_decimal_range(to_type),
+    ) else {
+        return false;
+    };
+
+    // A range is `raw / 10^scale`, so compare the two by cross multiplying into
+    // `i256`, which is wide enough to hold `10^38 * 10^38`.
+    let to_unit = i256::from_i128(POW10[to.scale as usize]);
+    let from_unit = i256::from_i128(POW10[from.scale as usize]);
+    i256::from_i128(from.min) * to_unit < i256::from_i128(to.min) * from_unit
+        || i256::from_i128(from.max) * to_unit > i256::from_i128(to.max) * from_unit
+}
+
+fn dictionary_value_type(data_type: &DataType) -> &DataType {
+    match data_type {
+        DataType::Dictionary(_, value_type) => value_type,
+        other => other,
+    }
+}
+
+/// The values an integer or decimal type can hold, as `min / 10^scale` to
+/// `max / 10^scale`.
+struct NumericRange {
+    min: i128,
+    max: i128,
+    scale: u8,
+}
+
+/// Powers of ten indexed by decimal scale, covering the widest decimal Arrow
+/// supports.
+const POW10: [i128; 39] = {
+    let mut powers = [1_i128; 39];
+    let mut i = 1;
+    while i < 39 {
+        powers[i] = powers[i - 1] * 10;
+        i += 1;
+    }
+    powers
+};
+
+/// The range of an integer or decimal type, or `None` for any other type.
+///
+/// A decimal with a negative scale is reported as `None`: it is out of range of
+/// [`POW10`], and [`try_cast_numeric_literal`] cannot scale one either.
+fn integer_or_decimal_range(data_type: &DataType) -> Option<NumericRange> {
+    let (min, max, scale) = match data_type {
+        DataType::Int8 => (i8::MIN as i128, i8::MAX as i128, 0),
+        DataType::Int16 => (i16::MIN as i128, i16::MAX as i128, 0),
+        DataType::Int32 => (i32::MIN as i128, i32::MAX as i128, 0),
+        DataType::Int64 => (i64::MIN as i128, i64::MAX as i128, 0),
+        DataType::UInt8 => (u8::MIN as i128, u8::MAX as i128, 0),
+        DataType::UInt16 => (u16::MIN as i128, u16::MAX as i128, 0),
+        DataType::UInt32 => (u32::MIN as i128, u32::MAX as i128, 0),
+        DataType::UInt64 => (u64::MIN as i128, u64::MAX as i128, 0),
+        DataType::Decimal32(precision, scale) if *scale >= 0 => (
+            MIN_DECIMAL32_FOR_EACH_PRECISION[*precision as usize] as i128,
+            MAX_DECIMAL32_FOR_EACH_PRECISION[*precision as usize] as i128,
+            *scale as u8,
+        ),
+        DataType::Decimal64(precision, scale) if *scale >= 0 => (
+            MIN_DECIMAL64_FOR_EACH_PRECISION[*precision as usize] as i128,
+            MAX_DECIMAL64_FOR_EACH_PRECISION[*precision as usize] as i128,
+            *scale as u8,
+        ),
+        DataType::Decimal128(precision, scale) if *scale >= 0 => (
+            MIN_DECIMAL128_FOR_EACH_PRECISION[*precision as usize],
+            MAX_DECIMAL128_FOR_EACH_PRECISION[*precision as usize],
+            *scale as u8,
+        ),
+        _ => return None,
+    };
+    ((scale as usize) < POW10.len()).then_some(NumericRange { min, max, scale })
 }
 
 fn timestamp_unit_scale(unit: &TimeUnit) -> i128 {
@@ -1034,6 +1132,76 @@ mod tests {
             &DataType::Date64
         ));
         assert!(!is_date_narrowing_cast(&DataType::Int64, &DataType::Date32));
+    }
+
+    #[test]
+    fn test_is_numeric_narrowing_cast() {
+        // Fewer bits, or the same bits with a different sign, drops values.
+        assert!(is_numeric_narrowing_cast(
+            &DataType::Int64,
+            &DataType::Int32
+        ));
+        assert!(is_numeric_narrowing_cast(&DataType::UInt8, &DataType::Int8));
+        assert!(is_numeric_narrowing_cast(
+            &DataType::Int64,
+            &DataType::UInt64
+        ));
+        assert!(is_numeric_narrowing_cast(
+            &DataType::UInt64,
+            &DataType::Int64
+        ));
+
+        // Widening and identity keep every value, so the rewrite stays eligible.
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Int32,
+            &DataType::Int64
+        ));
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Int32,
+            &DataType::Int32
+        ));
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::UInt8,
+            &DataType::Int16
+        ));
+
+        // A dictionary has the value domain of its value type.
+        assert!(is_numeric_narrowing_cast(
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64)),
+            &DataType::Int32
+        ));
+
+        // Decimals compare on precision and scale together: Decimal128(10, 0)
+        // reaches 10 digits, which does not fit in Decimal128(10, 2).
+        assert!(is_numeric_narrowing_cast(
+            &DataType::Decimal128(10, 0),
+            &DataType::Decimal128(10, 2)
+        ));
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Decimal128(10, 0),
+            &DataType::Decimal128(12, 2)
+        ));
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Int32,
+            &DataType::Decimal128(38, 10)
+        ));
+
+        // Dropping fractional digits is many-to-one rather than NULL-producing,
+        // so an in-range decimal to integer cast is not reported here.
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Decimal128(18, 2),
+            &DataType::Int64
+        ));
+
+        // Temporal types keep their own dedicated guards.
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Date64,
+            &DataType::Date32
+        ));
+        assert!(!is_numeric_narrowing_cast(
+            &DataType::Int64,
+            &DataType::Timestamp(TimeUnit::Second, None)
+        ));
     }
 
     #[test]

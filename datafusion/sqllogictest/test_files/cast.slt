@@ -125,3 +125,71 @@ set datafusion.optimizer.expand_views_at_output = false;
 
 statement ok
 drop table t;
+
+# A narrowing try_cast must keep its NULL-on-overflow behaviour when the
+# optimizer moves a cast out of a comparison. 9999999999 does not fit in INT, so
+# try_cast yields NULL and every comparison on it is UNKNOWN.
+statement ok
+create table narrowing_try_cast as values (5::bigint), (9999999999::bigint);
+
+query IIB
+select column1, try_cast(column1 as int) as c, try_cast(column1 as int) > 1 as p
+from narrowing_try_cast order by column1;
+----
+5 5 true
+9999999999 NULL NULL
+
+query I
+select column1 from narrowing_try_cast where try_cast(column1 as int) > 1;
+----
+5
+
+query TT
+explain select column1 from narrowing_try_cast where try_cast(column1 as int) > 1;
+----
+logical_plan
+01)Filter: TRY_CAST(narrowing_try_cast.column1 AS Int32) > Int32(1)
+02)--TableScan: narrowing_try_cast projection=[column1]
+physical_plan
+01)FilterExec: TRY_CAST(column1@0 AS Int32) > 1
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+drop table narrowing_try_cast;
+
+# The same applies to IN lists, where NOT IN turns a wrong false into a wrong
+# true and admits a row that must be excluded. 4294967301 is 2^32 + 5, so an
+# unwrapped comparison against 5 would match it.
+statement ok
+create table narrowing_try_cast as values (5::bigint), (4294967301::bigint);
+
+query IIB
+select column1, try_cast(column1 as int) as c, try_cast(column1 as int) in (5) as p
+from narrowing_try_cast order by column1;
+----
+5 5 true
+4294967301 NULL NULL
+
+query I
+select column1 from narrowing_try_cast where try_cast(column1 as int) not in (5);
+----
+
+statement ok
+drop table narrowing_try_cast;
+
+# A widening try_cast cannot overflow, so it is still unwrapped.
+statement ok
+create table widening_try_cast as values (5::int), (7::int);
+
+query TT
+explain select column1 from widening_try_cast where try_cast(column1 as bigint) > 1;
+----
+logical_plan
+01)Filter: widening_try_cast.column1 > Int32(1)
+02)--TableScan: widening_try_cast projection=[column1]
+physical_plan
+01)FilterExec: column1@0 > 1
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+drop table widening_try_cast;
