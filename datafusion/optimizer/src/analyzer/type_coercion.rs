@@ -20,15 +20,18 @@
 use arrow::compute::can_cast_types;
 use datafusion_expr::binary::BinaryTypeCoercer;
 use itertools::{Itertools as _, izip};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
 use crate::analyzer::AnalyzerRule;
 use crate::utils::{NamePreserver, merge_into_schema};
 
-use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, IntervalUnit, Schema, TimeUnit};
 use arrow::temporal_conversions::SECONDS_IN_DAY;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRewriter};
+use datafusion_common::tree_node::{
+    Transformed, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, Result, ScalarValue, TableReference,
     exec_err, internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err,
@@ -36,8 +39,8 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{
     self, AggregateFunctionParams, Alias, Between, BinaryExpr, Case, Exists,
-    HigherOrderFunction, InList, InSubquery, Like, ScalarFunction, SetComparison, Sort,
-    WindowFunction, in_subquery_tuple_values,
+    HigherOrderFunction, InList, InSubquery, Like, Placeholder, ScalarFunction,
+    SetComparison, Sort, WindowFunction, in_subquery_tuple_values,
 };
 use datafusion_expr::expr_rewriter::coerce_plan_expr_for_schema;
 use datafusion_expr::expr_schema::{cast_subquery, cast_subquery_columns};
@@ -100,22 +103,25 @@ impl AnalyzerRule for TypeCoercion {
 
         // Record bare row-count parameter types before coercion makes them indistinguishable
         // from explicit casts. A type inferred elsewhere takes precedence over the default.
-        let parameter_fields = plan.get_parameter_fields()?;
-        let plan = plan
-            .transform_up_with_subqueries(|plan| {
+        let row_count_fields = row_count_parameter_fields(&plan)?;
+        let plan = if row_count_fields.is_empty() {
+            plan
+        } else {
+            plan.transform_up_with_subqueries(|plan| {
                 if !matches!(plan, LogicalPlan::Limit(_)) {
                     return Ok(Transformed::no(plan));
                 }
                 plan.map_expressions(|expr| match expr {
                     Expr::Placeholder(mut placeholder) if placeholder.field.is_none() => {
                         placeholder.field =
-                            parameter_fields.get(&placeholder.id).cloned().flatten();
+                            row_count_fields.get(&placeholder.id).cloned();
                         Ok(Transformed::yes(Expr::Placeholder(placeholder)))
                     }
                     expr => Ok(Transformed::no(expr)),
                 })
             })?
-            .data;
+            .data
+        };
 
         // recurse
         let transformed_plan = plan
@@ -131,6 +137,48 @@ impl AnalyzerRule for TypeCoercion {
         // finish
         coerce_output(transformed_plan, config)
     }
+}
+
+/// Fields for the bare `LIMIT`/`OFFSET` placeholders of `plan`: the first type inferred
+/// for the same id elsewhere in the plan, otherwise `Int64`.
+///
+/// Unlike [`LogicalPlan::get_parameter_fields`] this does not fail when two occurrences
+/// of a placeholder disagree. That check belongs to `PREPARE`, and a plain plan can still
+/// bind its values later with `replace_params_with_values`.
+fn row_count_parameter_fields(plan: &LogicalPlan) -> Result<HashMap<String, FieldRef>> {
+    let mut row_count_ids: HashSet<String> = HashSet::new();
+    let mut inferred: HashMap<String, FieldRef> = HashMap::new();
+    plan.apply_with_subqueries(|plan| {
+        plan.apply_expressions(|expr| {
+            if matches!(plan, LogicalPlan::Limit(_))
+                && let Expr::Placeholder(Placeholder { id, field: None }) = expr
+            {
+                row_count_ids.insert(id.clone());
+            }
+            expr.apply(|expr| {
+                if let Expr::Placeholder(Placeholder {
+                    id,
+                    field: Some(field),
+                }) = expr
+                {
+                    inferred
+                        .entry(id.clone())
+                        .or_insert_with(|| Arc::clone(field));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })
+    })?;
+
+    Ok(row_count_ids
+        .into_iter()
+        .map(|id| {
+            let field = inferred
+                .remove(&id)
+                .unwrap_or_else(|| Arc::new(Field::new("", DataType::Int64, true)));
+            (id, field)
+        })
+        .collect())
 }
 
 /// use the external schema to handle the correlated subqueries case
@@ -1781,9 +1829,10 @@ mod test {
     use datafusion_common::tree_node::{TransformedResult, TreeNode};
     use datafusion_common::{
         DFSchema, DFSchemaRef, Result, ScalarValue, Spans, TableReference,
+        assert_contains,
     };
     use datafusion_expr::expr::{
-        self, InSubquery, Like, ScalarFunction, SetComparison, SetQuantifier,
+        self, InSubquery, Like, Placeholder, ScalarFunction, SetComparison, SetQuantifier,
     };
     use datafusion_expr::logical_plan::{EmptyRelation, Projection, Sort, table_scan};
     use datafusion_expr::test::function_stub::avg_udaf;
@@ -1886,6 +1935,56 @@ mod test {
         let analyzed = TypeCoercion::new().analyze(plan, &ConfigOptions::default())?;
 
         assert_eq!(analyzed.get_parameter_types()?["$1"], Some(DataType::Int64));
+        Ok(())
+    }
+
+    fn typed_placeholder(id: &str, data_type: DataType) -> Expr {
+        Expr::Placeholder(Placeholder::new_with_field(
+            id.to_string(),
+            Some(Arc::new(Field::new("", data_type, true))),
+        ))
+    }
+
+    fn conflicting_parameter_projection() -> Result<Arc<LogicalPlan>> {
+        Ok(Arc::new(LogicalPlan::Projection(Projection::try_new(
+            vec![
+                typed_placeholder("$1", DataType::Int32).alias("a"),
+                typed_placeholder("$1", DataType::Int64).alias("b"),
+            ],
+            empty(),
+        )?)))
+    }
+
+    #[test]
+    fn conflicting_parameter_types_do_not_fail_coercion() -> Result<()> {
+        let plan = (*conflicting_parameter_projection()?).clone();
+        let analyzed = TypeCoercion::new().analyze(plan, &ConfigOptions::default())?;
+
+        // PREPARE still reports the conflict.
+        let error = analyzed.get_parameter_fields().unwrap_err();
+        assert_contains!(error.to_string(), "Conflicting types for id $1");
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_parameter_types_keep_limit_parameter_type() -> Result<()> {
+        let plan = LogicalPlan::Limit(Limit {
+            input: conflicting_parameter_projection()?,
+            fetch: Some(Box::new(placeholder("$2"))),
+            skip: None,
+        });
+        let analyzed = TypeCoercion::new().analyze(plan, &ConfigOptions::default())?;
+
+        let LogicalPlan::Limit(limit) = &analyzed else {
+            panic!("expected LIMIT, got {analyzed:?}");
+        };
+        let Some(Expr::Placeholder(Placeholder {
+            field: Some(field), ..
+        })) = limit.fetch.as_deref()
+        else {
+            panic!("expected a typed LIMIT parameter, got {:?}", limit.fetch);
+        };
+        assert_eq!(field.data_type(), &DataType::Int64);
         Ok(())
     }
 

@@ -461,6 +461,27 @@ async fn test_limit_offset_parameters_keep_field_metadata() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_conflicting_parameter_types_still_optimize() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.sql(
+        "CREATE TABLE t AS SELECT \
+         arrow_cast(now(), 'Timestamp(Microsecond, Some(\"UTC\"))') AS ts",
+    )
+    .await?;
+
+    // Planning infers a different type for each occurrence of $1. Only PREPARE
+    // reports that conflict; a plain plan can bind its values later.
+    let state = ctx.state();
+    let plan = state
+        .create_logical_plan(
+            "SELECT ts FROM t WHERE ts >= $1 AND $1 = date_bin(INTERVAL '1 minute', $1)",
+        )
+        .await?;
+    state.optimize(&plan)?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_version_function() {
     let expected_version = format!(
         "Apache DataFusion {}, {} on {}",
